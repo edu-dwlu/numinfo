@@ -1,0 +1,66 @@
+name: Unzip Uploaded ZIP
+
+on:
+  push:
+    paths:
+      - "**/*.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find ZIP files
+        id: find_zip
+        run: |
+          ZIP_FILE=$(find . -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP file found."
+            exit 0
+          fi
+
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "Found: $ZIP_FILE"
+
+      - name: Unzip
+        if: steps.find_zip.outputs.zip_file != ''
+        run: |
+          ZIP_FILE="${{ steps.find_zip.outputs.zip_file }}"
+
+          echo "Extracting: $ZIP_FILE"
+
+          unzip -o "$ZIP_FILE" -d .
+
+          echo "Extraction completed."
+
+      - name: Remove ZIP file
+        if: steps.find_zip.outputs.zip_file != ''
+        run: |
+          rm -f "${{ steps.find_zip.outputs.zip_file }}"
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit extracted files
+        run: |
+          git add .
+          
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Extract uploaded ZIP file"
+          git push
