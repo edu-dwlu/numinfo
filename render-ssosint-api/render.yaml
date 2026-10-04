@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: render-ssosint-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: MY_API_KEY
+        sync: false
+      - key: ALLOWED_NUMBERS
+        sync: false
