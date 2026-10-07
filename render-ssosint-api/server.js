@@ -6,6 +6,10 @@ const PORT = process.env.PORT || 10000;
 const UPSTREAM_HOME = "https://ssosint.vercel.app/";
 const UPSTREAM_API = "https://ssosint.vercel.app/?api=1";
 
+// Cached upstream token (valid for its short lifetime).
+// Warm calls skip the homepage fetch entirely.
+let cachedToken = null;
+
 // ======================================================
 // Render health check
 // ======================================================
@@ -24,16 +28,35 @@ function sleep(ms) {
 }
 
 // ======================================================
-// Helper: fetch a completely fresh homepage
+// Helper: extract token from HTML
 // ======================================================
-async function getFreshHomepage() {
-  const cacheBuster = `${Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2)}`;
+function extractToken(html) {
+  if (!html || typeof html !== "string") return null;
 
-  const url = `${UPSTREAM_HOME}?_=${encodeURIComponent(cacheBuster)}`;
+  const patterns = [
+    /\bvar\s+t\s*=\s*["']([^"']+)["']/i,
+    /\blet\s+t\s*=\s*["']([^"']+)["']/i,
+    /\bconst\s+t\s*=\s*["']([^"']+)["']/i,
+    /\bt\s*=\s*["']([a-fA-F0-9]+)["']/i
+  ];
 
-  const response = await fetch(url, {
+  for (const regex of patterns) {
+    const match = html.match(regex);
+    if (match && match[1]) return match[1].trim();
+  }
+
+  return null;
+}
+
+// ======================================================
+// Helper: get token (cached, streamed homepage read)
+// ======================================================
+async function getToken(forceRefresh = false) {
+  if (!forceRefresh && cachedToken) {
+    return cachedToken;
+  }
+
+  const response = await fetch(UPSTREAM_HOME, {
     method: "GET",
     redirect: "follow",
     cache: "no-store",
@@ -53,58 +76,58 @@ async function getFreshHomepage() {
     }
   });
 
-  const html = await response.text();
-
-  return {
-    response,
-    html
-  };
-}
-
-// ======================================================
-// Helper: extract token from homepage
-// Supports:
-// var t = "abcdef"
-// var t='abcdef'
-// var t = 'abcdef'
-// let/const t = "abcdef" too
-// ======================================================
-function extractToken(html) {
-  if (!html || typeof html !== "string") {
-    return null;
+  if (!response.ok) {
+    throw new Error(
+      `Homepage request failed with status ${response.status}`
+    );
   }
 
-  const patterns = [
-    /\bvar\s+t\s*=\s*["']([^"']+)["']/i,
-    /\blet\s+t\s*=\s*["']([^"']+)["']/i,
-    /\bconst\s+t\s*=\s*["']([^"']+)["']/i,
-    /\bt\s*=\s*["']([a-fA-F0-9]+)["']/i
-  ];
+  // Stream the homepage and abort as soon as the token is found,
+  // instead of downloading the entire page.
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let token = null;
 
-  for (const regex of patterns) {
-    const match = html.match(regex);
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-    if (match && match[1]) {
-      return match[1].trim();
+    buf += decoder.decode(value, { stream: true });
+
+    const m = extractToken(buf);
+    if (m) {
+      token = m;
+      break;
     }
   }
 
-  return null;
+  try { reader.cancel(); } catch {}
+
+  if (!token) {
+    console.error("Token not found. Partial HTML length:", buf.length);
+    console.error(
+      "HTML preview:",
+      buf.slice(0, 300).replace(/\s+/g, " ")
+    );
+    throw new Error("Upstream token not found");
+  }
+
+  console.log(
+    "Fresh token obtained:",
+    tokenFingerprint(token)
+  );
+
+  cachedToken = token;
+  return token;
 }
 
 // ======================================================
 // Helper: safe token fingerprint for logs
-// Never log the real token
 // ======================================================
 function tokenFingerprint(token) {
-  if (!token) {
-    return "none";
-  }
-
-  if (token.length <= 8) {
-    return `${token.slice(0, 3)}...`;
-  }
-
+  if (!token) return "none";
+  if (token.length <= 8) return `${token.slice(0, 3)}...`;
   return `${token.slice(0, 4)}...${token.slice(-4)}`;
 }
 
@@ -130,8 +153,7 @@ async function callUpstream(query, token) {
         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
 
-      "Accept":
-        "application/json,text/plain,*/*",
+      "Accept": "application/json,text/plain,*/*",
 
       "Cache-Control": "no-cache, no-store, must-revalidate",
       "Pragma": "no-cache",
@@ -147,48 +169,7 @@ async function callUpstream(query, token) {
 
   const text = await response.text();
 
-  return {
-    response,
-    text
-  };
-}
-
-// ======================================================
-// Helper: get a NEW token
-// Always fetches homepage again
-// ======================================================
-async function getNewToken() {
-  const { response, html } = await getFreshHomepage();
-
-  if (!response.ok) {
-    throw new Error(
-      `Homepage request failed with status ${response.status}`
-    );
-  }
-
-  const token = extractToken(html);
-
-  if (!token) {
-    // Print a tiny diagnostic only
-    console.error(
-      "Token not found. Homepage length:",
-      html.length
-    );
-
-    console.error(
-      "Homepage preview:",
-      html.slice(0, 300).replace(/\s+/g, " ")
-    );
-
-    throw new Error("Upstream token not found");
-  }
-
-  console.log(
-    "Fresh token obtained:",
-    tokenFingerprint(token)
-  );
-
-  return token;
+  return { response, text };
 }
 
 // ======================================================
@@ -232,9 +213,7 @@ async function handleApi(req, res) {
   // ====================================================
   // 3. Query
   // ====================================================
-  const query = String(
-    req.query.query || ""
-  ).trim();
+  const query = String(req.query.query || "").trim();
 
   if (!query) {
     return res.status(400).json({
@@ -264,11 +243,10 @@ async function handleApi(req, res) {
   }
 
   // ====================================================
-  // 5. Fresh token + POST
+  // 5. Cached token + POST
   // ====================================================
   try {
-    // ALWAYS obtain a brand-new token
-    let token = await getNewToken();
+    let token = await getToken();
 
     let upstream = await callUpstream(query, token);
 
@@ -276,17 +254,11 @@ async function handleApi(req, res) {
       `Upstream attempt #1: HTTP ${upstream.response.status}`
     );
 
+    let upstreamData = null;
+    try { upstreamData = JSON.parse(upstream.text); } catch {}
+
     // ==================================================
-    // 6. Retry once using a newly fetched token
-    // ==================================================
-    //
-    // This protects against:
-    // - cached/stale token
-    // - token rotation
-    // - temporary upstream token mismatch
-    //
-    // We do not assume every error means token failure,
-    // so only retry on likely token/auth failures.
+    // 6. Retry once with a fresh token on token failure
     // ==================================================
     const responseLower = upstream.text.toLowerCase();
 
@@ -305,27 +277,42 @@ async function handleApi(req, res) {
         "Possible token failure. Fetching a COMPLETELY NEW token..."
       );
 
-      // Tiny delay before retry
       await sleep(150);
 
-      token = await getNewToken();
+      token = await getToken(true);
 
       upstream = await callUpstream(query, token);
 
       console.log(
         `Upstream attempt #2: HTTP ${upstream.response.status}`
       );
+
+      try { upstreamData = JSON.parse(upstream.text); } catch {}
+    }
+
+    if (!upstreamData) {
+      return res.status(502).json({
+        success: false,
+        error: "Invalid JSON received from upstream"
+      });
     }
 
     // ==================================================
-    // 7. Return upstream result
+    // 7. Modify ONLY top-level metadata fields
+    // ==================================================
+    upstreamData.api_by = "Mr_Unknown";
+
+    delete upstreamData._contact;
+    delete upstreamData._telegram_channel;
+
+    // ==================================================
+    // 8. Return modified result
     // ==================================================
     res.status(upstream.response.status);
 
     res.setHeader(
       "Content-Type",
-      upstream.response.headers.get("content-type") ||
-        "application/json; charset=utf-8"
+      "application/json; charset=utf-8"
     );
 
     res.setHeader(
@@ -336,7 +323,7 @@ async function handleApi(req, res) {
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
 
-    return res.send(upstream.text);
+    return res.json(upstreamData);
 
   } catch (error) {
     console.error(
