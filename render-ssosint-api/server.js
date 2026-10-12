@@ -41,6 +41,16 @@ function newPlainKey() {
   return "sk_" + crypto.randomBytes(24).toString("base64url");
 }
 
+// Total is the hard ceiling: a daily limit higher than the total
+// (or "unlimited daily" alongside a capped total) is clamped down
+// so daily usage can never overshoot the total.
+function clampDaily(maxTotal, maxDaily) {
+  if (maxTotal > 0 && (maxDaily === 0 || maxDaily > maxTotal)) {
+    return maxTotal;
+  }
+  return maxDaily;
+}
+
 function sanitizeRecord(rec) {
   return {
     id: rec.id,
@@ -84,8 +94,9 @@ function importRecord(obj) {
     prefix: plain.slice(0, 7),
     createdAt: obj.createdAt || new Date().toISOString(),
     expiresAt: obj.expiresAt || null,
-    maxTotal: Number(obj.maxTotal || 0),
-    maxDaily: Number(obj.maxDaily || 0),
+    maxTotal: Math.max(0, Number(obj.maxTotal || 0)),
+    // Daily can never exceed total: total is the hard ceiling.
+    maxDaily: clampDaily(Math.max(0, Number(obj.maxTotal || 0)), Math.max(0, Number(obj.maxDaily || 0))),
     usedTotal: Number(obj.usedTotal || 0),
     usedDaily: obj.usedDaily && typeof obj.usedDaily === "object" ? obj.usedDaily : {},
     numbers: Array.isArray(obj.numbers)
@@ -416,12 +427,17 @@ async function handleApi(req, res) {
         res.setHeader("X-Quota-Total-Remaining", String(issued.maxTotal - issued.usedTotal));
       }
       if (issued.maxDaily > 0) {
-        const left = issued.maxDaily - (issued.usedDaily[todayStr()] || 0);
-        res.setHeader("X-Quota-Daily-Remaining", String(left));
+        let left = issued.maxDaily - (issued.usedDaily[todayStr()] || 0);
+        // Daily remaining can never exceed total remaining.
+        if (issued.maxTotal > 0) {
+          left = Math.min(left, issued.maxTotal - issued.usedTotal);
+        }
+        res.setHeader("X-Quota-Daily-Remaining", String(Math.max(0, left)));
       }
     }
-
     upstreamData.api_by = "Mr_Unknown";
+
+    delete upstreamData.proxy_by;
     delete upstreamData._contact;
     delete upstreamData._telegram_channel;
 
@@ -519,6 +535,8 @@ app.patch("/dash/api/keys/:id", requireDashAuth, (req, res) => {
   if (b.enabled !== undefined) rec.enabled = Boolean(b.enabled);
   if (b.maxTotal !== undefined) rec.maxTotal = Math.max(0, Number(b.maxTotal) || 0);
   if (b.maxDaily !== undefined) rec.maxDaily = Math.max(0, Number(b.maxDaily) || 0);
+  // Keep daily capped at total (also when only total was lowered).
+  rec.maxDaily = clampDaily(rec.maxTotal, rec.maxDaily);
   if (b.expiresAt !== undefined) {
     rec.expiresAt = b.expiresAt ? new Date(b.expiresAt).toISOString() : null;
   }
